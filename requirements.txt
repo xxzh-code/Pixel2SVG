@@ -1,0 +1,5 @@
+# Pillow 是可选依赖。
+# Windows 未安装 Pillow 时，程序会自动使用系统 WIC 解码常见格式；
+# 安装 Pillow 后可以读取 ICO / TGA / PPM / PCX / DDS 等更多格式，
+# 并且预览缩放会更快、更平滑。
+Pillow>=10.0

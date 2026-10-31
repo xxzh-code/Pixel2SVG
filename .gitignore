@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+tests/.tmp/
+.edge-profile/
+venv/
+.venv/
+*.log
