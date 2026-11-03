@@ -204,6 +204,7 @@ python pixel2svg.py 输入.png --export 输出.svg --backend wic
 ├── Pixel2SVG.pyw          # 无控制台窗口启动器
 ├── 启动 Pixel2SVG.bat     # Windows 双击启动
 ├── requirements.txt       # 可选依赖 Pillow
+├── LICENSE                # MIT License
 ├── examples/
 │   ├── demo_pixel_art.png         # 带透明度的示例图片
 │   ├── demo_pixel_art.svg         # 严格 rect 输出
@@ -236,3 +237,9 @@ PNG/JPEG/TIFF EXIF 方向，以及 Pillow 与 WIC 解码结果一致性等。
 - 未安装 Pillow 的 Windows 环境依赖系统 WIC；个别格式（如 TGA）需要 Pillow
 - 未安装 Pillow 时，带 EXIF 旋转的大图（如 12MP JPEG）会多花约 2–3 秒做纯 Python 旋转，但界面不会冻结
 - 预览是叠加棋盘格的位图；导出的 SVG 才是真正的矢量文件
+
+## License
+
+本项目采用 **MIT License**，详见 [LICENSE](LICENSE)。
+
+Copyright (c) 2026 xxzh-code
