@@ -10,6 +10,7 @@ Pixel2SVG · 核心模块
     * 默认 strict：一个不透明/半透明像素 -> 一个 1×1 的 <rect>
     * compact：每种 RGBA 颜色一条 <path>，每个像素仍是 1×1 子路径
     * merged：允许把相邻、容差内的近似色合并成更大的矩形
+    * outline：连通近似色区域，追踪任意正交轮廓并支持孔洞
     * 支持从整图中裁出矩形区域后再导出
     * 完全透明的像素          ->  不生成图形（画布保持透明）
     * 像素颜色按 sRGB 原样保存，透明度写入 fill-opacity
@@ -774,6 +775,7 @@ def estimate_svg_size(
     mode: str = "strict",
     color_count: Optional[int] = None,
     rect_count: Optional[int] = None,
+    path_chars: Optional[int] = None,
 ) -> int:
     """估算 SVG 文件大小，用于界面提示。"""
     if mode == "compact":
@@ -782,6 +784,10 @@ def estimate_svg_size(
     if mode == "merged":
         count = image.opaque_count if rect_count is None else rect_count
         return 1200 + count * 72
+    if mode == "outline":
+        count = 0 if rect_count is None else rect_count
+        chars = 0 if path_chars is None else path_chars
+        return 1500 + chars + count * 70
     translucent = min(image.translucent_count, image.opaque_count)
     return 900 + image.opaque_count * 57 + translucent * 26
 
@@ -1013,6 +1019,233 @@ def count_merged_rectangles(image: BitmapImage, tolerance: int = 0) -> int:
     return sum(1 for _ in iter_merged_rectangles(image, tolerance))
 
 
+_DIRECTION_POINT = ((1, 0), (0, 1), (-1, 0), (0, -1))
+_TURN_PRIORITY = {1: 0, 0: 1, 3: 2, 2: 3}
+
+
+def _outline_path(start: tuple[int, int], directions: list[int]) -> str:
+    """把一圈边界方向压缩成只含水平/垂直线段的 path。
+
+    闭合环的最后一段由 z 自动完成，因此可以省略最后一段游程。
+    """
+    if not directions:
+        return ""
+    runs: list[tuple[int, int]] = []
+    index = 0
+    while index < len(directions):
+        direction = directions[index]
+        end = index + 1
+        while end < len(directions) and directions[end] == direction:
+            end += 1
+        runs.append((direction, end - index))
+        index = end
+    if runs:
+        runs.pop()
+    sx, sy = start
+    parts = [f"M{sx} {sy}"]
+    for direction, length in runs:
+        if direction == 0:
+            parts.append(f"h{length}")
+        elif direction == 1:
+            parts.append(f"v{length}")
+        elif direction == 2:
+            parts.append(f"h-{length}")
+        else:
+            parts.append(f"v-{length}")
+    parts.append("z")
+    return "".join(parts)
+
+
+def _trace_region_paths(edges: list[tuple[int, int, int]]) -> list[str]:
+    outgoing: dict[tuple[int, int], list[int]] = {}
+    for x, y, direction in edges:
+        outgoing.setdefault((x, y), []).append(direction)
+    used: set[tuple[int, int, int]] = set()
+    subpaths: list[str] = []
+    for sx, sy, start_direction in edges:
+        if (sx, sy, start_direction) in used:
+            continue
+        cx, cy = sx, sy
+        direction = start_direction
+        directions: list[int] = []
+        while True:
+            key = (cx, cy, direction)
+            if key in used:
+                break
+            used.add(key)
+            directions.append(direction)
+            dx, dy = _DIRECTION_POINT[direction]
+            nx, ny = cx + dx, cy + dy
+            if (nx, ny) == (sx, sy):
+                break
+            candidates = [
+                candidate
+                for candidate in outgoing.get((nx, ny), ())
+                if (nx, ny, candidate) not in used
+            ]
+            if not candidates:
+                break
+            candidates.sort(
+                key=lambda candidate: _TURN_PRIORITY[
+                    (candidate - direction) % 4
+                ]
+            )
+            cx, cy = nx, ny
+            direction = candidates[0]
+        if directions:
+            subpaths.append(_outline_path((sx, sy), directions))
+    return subpaths
+
+
+def iter_outline_regions(image: BitmapImage, tolerance: int = 0):
+    """把 4 邻接的近似色像素连通成区域，并沿像素边追踪任意轮廓。
+
+    生成 (path_d, red, green, blue, alpha, pixel_count)。
+    一个区域可能有多个子路径（外轮廓 + 孔洞），使用 evenodd 填充。
+    tolerance 对 RGBA 四个通道分别生效；0 表示只连通完全同色像素。
+    """
+    tolerance = max(0, min(255, int(tolerance)))
+    width, height = image.width, image.height
+    total = width * height
+    rgba = image.rgba
+    parent = array("i", range(total))
+    size = array("i", [1]) * total
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first: int, second: int) -> None:
+        root_a = find(first)
+        root_b = find(second)
+        if root_a == root_b:
+            return
+        if size[root_a] < size[root_b]:
+            root_a, root_b = root_b, root_a
+        parent[root_b] = root_a
+        size[root_a] += size[root_b]
+
+    def visible(index: int) -> bool:
+        return rgba[index * 4 + 3] != 0
+
+    for y in range(height):
+        row = y * width
+        for x in range(width):
+            index = row + x
+            if not visible(index):
+                continue
+            offset = index * 4
+            red = rgba[offset]
+            green = rgba[offset + 1]
+            blue = rgba[offset + 2]
+            alpha = rgba[offset + 3]
+            if x + 1 < width:
+                other = index + 1
+                if visible(other):
+                    other_offset = other * 4
+                    if _within_tolerance(
+                        red,
+                        green,
+                        blue,
+                        alpha,
+                        (
+                            rgba[other_offset],
+                            rgba[other_offset + 1],
+                            rgba[other_offset + 2],
+                            rgba[other_offset + 3],
+                        ),
+                        tolerance,
+                    ):
+                        union(index, other)
+            if y + 1 < height:
+                other = index + width
+                if visible(other):
+                    other_offset = other * 4
+                    if _within_tolerance(
+                        red,
+                        green,
+                        blue,
+                        alpha,
+                        (
+                            rgba[other_offset],
+                            rgba[other_offset + 1],
+                            rgba[other_offset + 2],
+                            rgba[other_offset + 3],
+                        ),
+                        tolerance,
+                    ):
+                        union(index, other)
+
+    labels = array("i", [-1]) * total
+    representatives: dict[int, tuple[int, int, int, int]] = {}
+    counts: dict[int, int] = {}
+    for y in range(height):
+        row = y * width
+        for x in range(width):
+            index = row + x
+            if not visible(index):
+                continue
+            root = find(index)
+            labels[index] = root
+            offset = index * 4
+            if root not in representatives:
+                representatives[root] = (
+                    rgba[offset],
+                    rgba[offset + 1],
+                    rgba[offset + 2],
+                    rgba[offset + 3],
+                )
+            counts[root] = counts.get(root, 0) + 1
+
+    edge_lists: dict[int, list[tuple[int, int, int]]] = {}
+    for y in range(height):
+        row = y * width
+        for x in range(width):
+            index = row + x
+            label = labels[index]
+            if label < 0:
+                continue
+            edges = edge_lists.setdefault(label, [])
+            if y == 0 or labels[index - width] != label:
+                edges.append((x, y, 0))
+            if x == width - 1 or labels[index + 1] != label:
+                edges.append((x + 1, y, 1))
+            if y == height - 1 or labels[index + width] != label:
+                edges.append((x + 1, y + 1, 2))
+            if x == 0 or labels[index - 1] != label:
+                edges.append((x, y + 1, 3))
+
+    for label, edges in edge_lists.items():
+        subpaths = _trace_region_paths(edges)
+        if not subpaths:
+            continue
+        red, green, blue, alpha = representatives[label]
+        yield (
+            "".join(subpaths),
+            red,
+            green,
+            blue,
+            alpha,
+            counts[label],
+        )
+
+
+def measure_outline_regions(
+    image: BitmapImage, tolerance: int = 0
+) -> tuple[int, int]:
+    """返回 (区域数, path 字符总数)，用于界面估算。"""
+    count = 0
+    chars = 0
+    for path, _r, _g, _b, _a, _pixels in iter_outline_regions(
+        image, tolerance
+    ):
+        count += 1
+        chars += len(path)
+    return count, chars
+
+
 def _opacity_text(alpha: int) -> str:
     text = f"{alpha / 255:.6f}".rstrip("0").rstrip(".")
     return text or "0"
@@ -1083,8 +1316,10 @@ def export_svg(
     """
     import time
 
-    if mode not in ("strict", "compact", "merged"):
-        raise ValueError("mode 必须是 strict、compact 或 merged")
+    if mode not in ("strict", "compact", "merged", "outline"):
+        raise ValueError(
+            "mode 必须是 strict、compact、merged 或 outline"
+        )
     if not 0 <= int(tolerance) <= 255:
         raise ValueError("tolerance 必须在 0 到 255 之间")
     tolerance = int(tolerance)
@@ -1128,6 +1363,13 @@ def export_svg(
             f"相邻像素的 RGBA 每通道差不超过 {tolerance} 时合并为矩形；"
             "透明像素保持透明。合并会改变逐像素结构，请按需要选用。"
         )
+    elif mode == "outline":
+        description = html.escape(
+            f"Pixel2SVG 轮廓合并转换：{region_text}"
+            f"相邻像素的 RGBA 每通道差不超过 {tolerance} 时连通，"
+            "沿像素边追踪任意正交轮廓（evenodd 填充，含孔洞）；"
+            "透明像素保持透明。"
+        )
     else:
         description = html.escape(
             f"Pixel2SVG 严格逐像素转换：{region_text}"
@@ -1145,7 +1387,7 @@ def export_svg(
                 f'data-pixel-mode="{mode}" '
                 + (
                     f'data-tolerance="{tolerance}" '
-                    if mode == "merged"
+                    if mode in ("merged", "outline")
                     else ""
                 )
                 + f'shape-rendering="crispEdges">\n'
@@ -1229,7 +1471,7 @@ def export_svg(
                     rect_count = written
                     if progress is not None:
                         progress(height + written, total_steps)
-            else:
+            elif mode == "merged":
                 last_progress = 0
                 since_cancel_check = 0
                 for (
@@ -1268,6 +1510,39 @@ def export_svg(
                         progress(y_end, height)
                 if progress is not None and last_progress < height:
                     progress(height, height)
+            else:
+                processed = 0
+                had_region = False
+                for (
+                    path_d,
+                    red,
+                    green,
+                    blue,
+                    alpha,
+                    region_pixels,
+                ) in iter_outline_regions(image, tolerance):
+                    if cancel is not None and cancel():
+                        raise ExportCancelled("导出已取消")
+                    color = f"#{red:02x}{green:02x}{blue:02x}"
+                    opacity = (
+                        ""
+                        if alpha == 255
+                        else f' fill-opacity="{_opacity_text(alpha)}"'
+                    )
+                    handle.write(
+                        f'    <path fill="{color}" fill-rule="evenodd"'
+                        f'{opacity} d="{path_d}"/>\n'
+                    )
+                    rect_count += 1
+                    had_region = True
+                    processed += region_pixels
+                    if progress is not None:
+                        progress(
+                            processed,
+                            max(1, image.opaque_count),
+                        )
+                if progress is not None and not had_region:
+                    progress(1, 1)
 
             handle.write("  </g>\n")
             handle.write("</svg>\n")

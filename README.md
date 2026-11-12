@@ -3,7 +3,8 @@
 把一张位图**逐像素**翻译成 SVG：默认每个不透明或半透明像素变成一个独立的
 `1×1` 矢量正方形。严格模式下不做轮廓拟合、不做颜色聚类、不合并同色像素。
 
-另外提供两档可选的轻量结构：**紧凑 path**，以及允许调容差的**合并块**。
+另外提供三档可选的轻量结构：**紧凑 path**、允许调容差的**合并块**，以及
+沿像素边追踪任意轮廓、支持孔洞的**轮廓合并**。
 
 这是它和市面上大多数“位图转矢量”工具最根本的区别：那些工具试图猜测出一组
 光滑曲线，而 Pixel2SVG 只做一件事——把像素网格原样保存成矢量格式。
@@ -18,6 +19,8 @@
   `<path>`，每条路径仍由多个 `1×1` 正方形子路径组成。示例图从 95.6 KB 降到 24.5 KB
 - **合并块 + 容差**：允许把相邻且 RGBA 差值在容差内的像素合并成更大的矩形；
   容差 0–100 可调。示例图在容差 16 时从 1716 个图形降到 238 个、约 15.1 KB
+- **任意轮廓 + 容差**：把相邻近似色连通成区域，沿像素边追踪非矩形轮廓
+  （含孔洞）。示例图在容差 16 时只有 112 个区域、约 9.0 KB
 - **保留透明度**：`alpha = 0` 的像素不生成图形；`1 ≤ alpha < 255` 的像素使用
   `fill-opacity` 精确保留透明度
 - **常见格式**：PNG、JPEG、BMP、GIF、WebP、TIFF（Windows 内置 WIC 解码）
@@ -84,9 +87,9 @@ python3 -m pip install Pillow
 3. 如需局部导出，点工具栏的 **裁剪**，在预览中左键拖出选区；裁剪模式中可用
    右键拖动平移画布。点 **清除** 恢复整图。
 4. 在“输出规则”中设置 **SVG 显示倍数**（1–100）和 **SVG 结构**：
-   **严格 rect**、**紧凑 path** 或 **合并块**。选择合并块时可调 **颜色容差**
-   （0–100，0 表示只合并完全同色）。显示倍数只改变 SVG 根节点的显示宽高，
-   坐标仍是 1 像素 = 1 单位。
+   **严格 rect**、**紧凑 path**、**合并块** 或 **轮廓**。选择合并块或轮廓时
+   可调 **颜色容差**（0–100，0 表示只合并完全同色）。显示倍数只改变 SVG
+   根节点的显示宽高，坐标仍是 1 像素 = 1 单位。
 5. 点击“选择位置并导出 SVG”。
 6. 导出完成后，可以点“在文件夹中显示”。
 
@@ -184,6 +187,24 @@ python3 -m pip install Pillow
 这个模式会改变“每个像素一个独立图形”的结构，**默认不启用**。需要完全逐像素
 保真时请使用严格 rect 或紧凑 path。
 
+### 轮廓合并（任意轮廓 + 孔洞）
+
+“轮廓”模式不再把合并结果限制为矩形。它把 4 邻接的近似色像素连通成区域，
+再沿像素边追踪区域外轮廓和孔洞，每个区域输出一条 `<path>`：
+
+![轮廓合并模式](docs/screenshot-outline.png)
+
+- 轮廓是沿像素边的正交折线，支持凹形、L 形、环形和多个孔洞
+- 使用 `fill-rule="evenodd"` 处理孔洞
+- 不拟合贝塞尔曲线，保持像素边缘的硬朗风格
+- 容差规则与合并块一致：RGBA 四通道分别允许差值；`0` 只连通完全同色像素
+- 示例图容差 16：1716 个非透明像素合并为 **112 个轮廓区域**，约 **9.0 KB**
+- 轮廓区域按 4 邻接判断；对角相接但不共享边的像素属于不同区域
+
+示例文件：[轮廓合并输出（容差 16）](examples/demo_pixel_art_outline.svg)
+
+轮廓模式同样会改变逐像素结构，默认不启用；容差大于 0 时颜色取区域起点颜色。
+
 ## 文件体积
 
 严格逐像素意味着矩形数量 = 非全透明像素数量，文件会比“合并色块/曲线拟合”的
@@ -211,13 +232,14 @@ python pixel2svg.py 输入.png --export 输出.svg
 python pixel2svg.py 输入.png --export 输出.svg --scale 2
 python pixel2svg.py 输入.png --export 输出.svg --mode compact
 python pixel2svg.py 输入.png --export 输出.svg --mode merged --tolerance 16
+python pixel2svg.py 输入.png --export 输出.svg --mode outline --tolerance 16
 python pixel2svg.py 输入.png --export 输出.svg --backend wic
 ```
 
 - `--scale`：SVG 显示倍数，1–100
 - `--mode`：`strict`（默认，每像素一个 rect）/ `compact`（每色一条 path）/
-  `merged`（合并相邻近似色）
-- `--tolerance`：`merged` 模式的 RGBA 颜色容差，0–100
+  `merged`（合并相邻近似色为矩形）/ `outline`（合并为任意轮廓）
+- `--tolerance`：`merged` / `outline` 模式的 RGBA 颜色容差，0–100
 - `--backend`：`auto`（默认）/ `pillow` / `wic`
 
 ## 项目结构
@@ -235,11 +257,13 @@ python pixel2svg.py 输入.png --export 输出.svg --backend wic
 │   ├── demo_pixel_art.png         # 带透明度的示例图片
 │   ├── demo_pixel_art.svg         # 严格 rect 输出
 │   ├── demo_pixel_art_compact.svg # 紧凑 path 输出
-│   └── demo_pixel_art_merged.svg  # 合并块输出（容差 16）
+│   ├── demo_pixel_art_merged.svg  # 合并块输出（容差 16）
+│   └── demo_pixel_art_outline.svg # 轮廓合并输出（容差 16）
 ├── docs/
-│   ├── screenshot.png       # 界面截图
-│   ├── screenshot-crop.png  # 裁剪选区截图
-│   └── screenshot-merge.png # 合并块与容差截图
+│   ├── screenshot.png         # 界面截图
+│   ├── screenshot-crop.png    # 裁剪选区截图
+│   ├── screenshot-merge.png   # 合并块与容差截图
+│   └── screenshot-outline.png # 轮廓合并截图
 └── tests/test_core.py     # 核心行为测试
 ```
 
@@ -251,14 +275,16 @@ python -m unittest discover -s tests -v
 ```
 
 测试覆盖：每像素一个矩形、同色像素不合并、透明度、alpha 精度、从严格/紧凑 SVG
-逐像素还原、合并块的精确/容差合并、裁剪区域、颜色上限、显示倍数、取消导出、
-预览 PPM 尺寸、PNG/JPEG/TIFF EXIF 方向，以及 Pillow 与 WIC 解码结果一致性等。
+逐像素还原、合并块的精确/容差合并、轮廓区域/孔洞/容差连通、裁剪区域、颜色上限、
+显示倍数、取消导出、预览 PPM 尺寸、PNG/JPEG/TIFF EXIF 方向，以及 Pillow 与 WIC
+解码结果一致性等。
 
 ## 已知限制
 
 - 严格逐像素，因此大图生成的 SVG 很大；这是设计目标，不是 bug
 - 紧凑模式只是减少 XML 节点，不能改变“每个像素仍需一个正方形”的信息量
 - 合并块会改变图形结构；容差大于 0 时颜色也可能与原始像素略有偏差
+- 轮廓模式追踪的是沿像素边的正交轮廓，不做曲线拟合；区域按 4 邻接判定
 - 颜色超过 2048 种时紧凑模式会拒绝导出，以免文件反而更大
 - 动图只取第一帧
 - 不合并同色像素、不做轮廓拟合、不做抗锯齿

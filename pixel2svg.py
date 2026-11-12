@@ -14,6 +14,7 @@ Pixel2SVG · 像素矢量工坊
     python pixel2svg.py 图片.png --export 输出.svg [--scale 2]
     python pixel2svg.py 图片.png --export 输出.svg --mode compact
     python pixel2svg.py 图片.png --export 输出.svg --mode merged --tolerance 8
+    python pixel2svg.py 图片.png --export 输出.svg --mode outline --tolerance 16
 """
 
 from __future__ import annotations
@@ -46,10 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("strict", "compact", "merged"),
+        choices=("strict", "compact", "merged", "outline"),
         default="strict",
         help="SVG 结构：strict=每像素一个 rect（默认）；"
-        "compact=每色一条 path；merged=合并相邻近似色为矩形",
+        "compact=每色一条 path；merged=合并为矩形；"
+        "outline=合并为任意轮廓",
     )
     parser.add_argument(
         "--tolerance",
@@ -98,6 +100,9 @@ def headless_export(
     elif result.mode == "merged":
         mode_text = f"合并块 / 容差 {tolerance}"
         unit = "矩形"
+    elif result.mode == "outline":
+        mode_text = f"轮廓合并 / 容差 {tolerance}"
+        unit = "区域"
     else:
         mode_text = "严格 rect"
         unit = "正方形"

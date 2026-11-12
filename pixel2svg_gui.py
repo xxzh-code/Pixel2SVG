@@ -24,7 +24,7 @@ from typing import Optional
 import pixel2svg_core as core
 
 APP_TITLE = "Pixel2SVG · 像素矢量工坊"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 # 色彩系统：暖纸色 + 墨绿 + 珊瑚色
 BG = "#F3F0E8"
@@ -384,6 +384,10 @@ class Pixel2SVGApp:
         self._merge_count_tolerance: Optional[int] = None
         self._merge_count_value: Optional[int] = None
         self._merge_count_ready = False
+        self._outline_stats_image: Optional[core.BitmapImage] = None
+        self._outline_stats_tolerance: Optional[int] = None
+        self._outline_stats_value: Optional[tuple[int, int]] = None
+        self._outline_stats_ready = False
         self._tolerance_job: Optional[str] = None
         self._active_export_mode = "strict"
         self._active_export_tolerance = 0
@@ -830,6 +834,7 @@ class Pixel2SVGApp:
             ("strict", "严格 rect"),
             ("compact", "紧凑 path"),
             ("merged", "合并块"),
+            ("outline", "轮廓"),
         ):
             button = tk.Radiobutton(
                 mode_box,
@@ -1350,6 +1355,7 @@ class Pixel2SVGApp:
         self._color_count_cache = None
         self._color_count_ready = False
         self._invalidate_merge_count()
+        self._invalidate_outline_stats()
         self.canvas.configure(cursor="")
         self._refresh_action_states()
         try:
@@ -1466,6 +1472,33 @@ class Pixel2SVGApp:
         self._merge_count_value = None
         self._merge_count_ready = False
 
+    def _invalidate_outline_stats(self) -> None:
+        self._outline_stats_image = None
+        self._outline_stats_tolerance = None
+        self._outline_stats_value = None
+        self._outline_stats_ready = False
+
+    def _get_outline_stats(
+        self, image: core.BitmapImage
+    ) -> Optional[tuple[int, int]]:
+        tolerance = self._get_tolerance()
+        if (
+            self._outline_stats_ready
+            and self._outline_stats_image is image
+            and self._outline_stats_tolerance == tolerance
+        ):
+            return self._outline_stats_value
+        self._outline_stats_image = image
+        self._outline_stats_tolerance = tolerance
+        self._outline_stats_ready = True
+        if image.total_pixels > 2_500_000:
+            self._outline_stats_value = None
+        else:
+            self._outline_stats_value = core.measure_outline_regions(
+                image, tolerance
+            )
+        return self._outline_stats_value
+
     def _get_merged_count(self, image: core.BitmapImage) -> Optional[int]:
         tolerance = self._get_tolerance()
         if (
@@ -1494,7 +1527,8 @@ class Pixel2SVGApp:
         self.tolerance_var.set(tolerance)
         self.tolerance_value_var.set(str(tolerance))
         self._invalidate_merge_count()
-        if self.mode_var.get() != "merged":
+        self._invalidate_outline_stats()
+        if self.mode_var.get() not in ("merged", "outline"):
             return
         if self._tolerance_job is not None:
             try:
@@ -1505,13 +1539,13 @@ class Pixel2SVGApp:
 
     def _refresh_tolerance_stats(self) -> None:
         self._tolerance_job = None
-        if self.mode_var.get() == "merged":
+        if self.mode_var.get() in ("merged", "outline"):
             self._update_stats()
             self._on_scale_changed()
 
     def _on_mode_changed(self) -> None:
         mode = self.mode_var.get()
-        if mode == "merged":
+        if mode in ("merged", "outline"):
             if not self.tolerance_row.winfo_manager():
                 self.tolerance_row.pack(
                     fill="x",
@@ -1528,9 +1562,15 @@ class Pixel2SVGApp:
         mode = self.mode_var.get()
         if hasattr(self, "rect_caption_label"):
             self.rect_caption_label.configure(
-                text="矩形" if mode == "merged" else "正方形"
+                text=(
+                    "区域"
+                    if mode == "outline"
+                    else ("矩形" if mode == "merged" else "正方形")
+                )
             )
-        if mode == "merged":
+        if mode == "outline":
+            self.rule_var.set("相邻近似色   →   合并为任意轮廓")
+        elif mode == "merged":
             self.rule_var.set("相邻近似色   →   合并为矩形")
         elif mode == "compact":
             self.rule_var.set("1 像素   →   1 个 path 子方格")
@@ -1540,7 +1580,12 @@ class Pixel2SVGApp:
             self.rect_var.set("—")
             self.alpha_var.set("—")
             self.size_var.set("—")
-            if mode == "merged":
+            if mode == "outline":
+                self.mode_note_var.set(
+                    f"轮廓 · 容差 {self._get_tolerance()} · "
+                    "相邻近似色连通为任意轮廓"
+                )
+            elif mode == "merged":
                 self.mode_note_var.set(
                     f"合并块 · 容差 {self._get_tolerance()} · "
                     "相邻近似色合并为矩形"
@@ -1612,6 +1657,37 @@ class Pixel2SVGApp:
                     self.mode_note_var.set(
                         f"相邻色差 ≤ {tolerance} 合并为矩形 · "
                         f"共 {count:,} 个"
+                    )
+        elif mode == "outline":
+            tolerance = self._get_tolerance()
+            stats = self._get_outline_stats(image)
+            if stats is None:
+                self.rect_var.set("—")
+                self.size_var.set("导出时算")
+                self.mode_note_var.set(
+                    f"轮廓 · 容差 {tolerance} · 大图在导出时统计区域"
+                )
+            else:
+                count, path_chars = stats
+                self.rect_var.set(f"{count:,}")
+                self.size_var.set(
+                    core.human_size(
+                        core.estimate_svg_size(
+                            image,
+                            mode="outline",
+                            rect_count=count,
+                            path_chars=path_chars,
+                        )
+                    )
+                )
+                if tolerance == 0:
+                    self.mode_note_var.set(
+                        f"仅连通完全相同的颜色 · 共 {count:,} 个区域"
+                    )
+                else:
+                    self.mode_note_var.set(
+                        f"相邻色差 ≤ {tolerance} 连通为轮廓 · "
+                        f"共 {count:,} 个区域"
                     )
         else:
             self.rect_var.set(f"{image.opaque_count:,}")
@@ -2166,6 +2242,7 @@ class Pixel2SVGApp:
                 self._color_count_cache = None
                 self._color_count_ready = False
                 self._invalidate_merge_count()
+                self._invalidate_outline_stats()
                 self._update_stats()
                 self._on_scale_changed()
                 self._refresh_crop_controls()
@@ -2187,6 +2264,7 @@ class Pixel2SVGApp:
         self._color_count_cache = None
         self._color_count_ready = False
         self._invalidate_merge_count()
+        self._invalidate_outline_stats()
         self._refresh_crop_controls()
         self._update_stats()
         self._on_scale_changed()
@@ -2284,6 +2362,7 @@ class Pixel2SVGApp:
         self._color_count_cache = None
         self._color_count_ready = False
         self._invalidate_merge_count()
+        self._invalidate_outline_stats()
         self._refresh_crop_controls()
         self._update_stats()
         self._on_scale_changed()
@@ -2463,9 +2542,14 @@ class Pixel2SVGApp:
             return
         scale = self._get_scale()
         mode = self.mode_var.get()
-        tolerance = self._get_tolerance() if mode == "merged" else 0
+        tolerance = (
+            self._get_tolerance()
+            if mode in ("merged", "outline")
+            else 0
+        )
         colors = None
         merged_count = None
+        outline_stats = None
         if mode == "compact":
             colors = self._get_color_count()
             if colors is None:
@@ -2485,6 +2569,8 @@ class Pixel2SVGApp:
                 colors = None
         elif mode == "merged":
             merged_count = self._get_merged_count(image)
+        elif mode == "outline":
+            outline_stats = self._get_outline_stats(image)
 
         source = self.source_path or Path("pixel2svg")
         initial = self.output_path or source.with_suffix(".svg")
@@ -2501,13 +2587,48 @@ class Pixel2SVGApp:
         destination = Path(path)
         if destination.suffix.lower() != ".svg":
             destination = destination.with_suffix(".svg")
-        item_count = (
-            merged_count
-            if mode == "merged" and merged_count is not None
-            else image.opaque_count
-        )
+        if mode == "merged":
+            item_count = (
+                merged_count
+                if merged_count is not None
+                else image.opaque_count
+            )
+        elif mode == "outline":
+            item_count = (
+                outline_stats[0]
+                if outline_stats is not None
+                else image.opaque_count
+            )
+        else:
+            item_count = image.opaque_count
         if item_count > 250_000:
-            if mode == "merged":
+            if mode == "outline":
+                outline_count = (
+                    outline_stats[0] if outline_stats is not None else 0
+                )
+                outline_chars = (
+                    outline_stats[1] if outline_stats is not None else 0
+                )
+                if outline_stats is None:
+                    estimated = core.human_size(
+                        core.estimate_svg_size(image)
+                    )
+                else:
+                    estimated = core.human_size(
+                        core.estimate_svg_size(
+                            image,
+                            mode="outline",
+                            rect_count=outline_count,
+                            path_chars=outline_chars,
+                        )
+                    )
+                mode_word = f"轮廓合并（容差 {tolerance}）"
+                detail = (
+                    f"最多会生成 {item_count:,} 个轮廓区域，"
+                    f"预计约 {estimated}。"
+                )
+                action = "会沿像素边追踪任意轮廓并合并孔洞"
+            elif mode == "merged":
                 estimated = core.human_size(
                     core.estimate_svg_size(
                         image,
@@ -2571,11 +2692,17 @@ class Pixel2SVGApp:
         if image is None:
             return
         expected_rects = image.opaque_count
+        unit = "正方形"
         if mode == "merged":
             merged_count = self._get_merged_count(image)
             if merged_count is not None:
                 expected_rects = merged_count
-        unit = "矩形" if mode == "merged" else "正方形"
+            unit = "矩形"
+        elif mode == "outline":
+            outline_stats = self._get_outline_stats(image)
+            if outline_stats is not None:
+                expected_rects = outline_stats[0]
+            unit = "区域"
         self._active_export_mode = mode
         self._active_export_tolerance = tolerance
         self.exporting = True
@@ -2584,6 +2711,8 @@ class Pixel2SVGApp:
         self._refresh_action_states()
         if mode == "merged":
             self._set_status("正在按容差合并相邻色块…", "busy")
+        elif mode == "outline":
+            self._set_status("正在沿像素边追踪任意轮廓…", "busy")
         else:
             self._set_status(
                 f"正在逐像素生成 {image.opaque_count:,} 个正方形…",
@@ -2677,9 +2806,18 @@ class Pixel2SVGApp:
             mode_text = (
                 f"合并块 · 容差 {self._active_export_tolerance}"
             )
+        elif result.mode == "outline":
+            mode_text = (
+                f"轮廓合并 · 容差 {self._active_export_tolerance}"
+            )
         else:
             mode_text = "严格 rect"
-        count_word = "矩形" if result.mode == "merged" else "正方形"
+        if result.mode == "outline":
+            count_word = "区域"
+        elif result.mode == "merged":
+            count_word = "矩形"
+        else:
+            count_word = "正方形"
         self._set_status(
             f"已导出 {result.rect_count:,} 个{count_word} · {mode_text} · "
             f"{core.human_size(result.file_size)} · {result.elapsed:.1f}s",

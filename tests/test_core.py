@@ -373,6 +373,81 @@ class CoreTests(unittest.TestCase):
                     )
         self.assertEqual(bytes(rebuilt), image.rgba)
 
+    def test_outline_solid_region_is_one_path(self):
+        image_path = self.path("outline_solid.png")
+        make_png(image_path, 5, 4, lambda _x, _y: (20, 80, 160, 255))
+        image = core.load_bitmap(
+            image_path, backend="wic" if core.IS_WINDOWS else "auto"
+        )
+        regions = list(core.iter_outline_regions(image, 0))
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0][0], "M0 0h5v4h-5z")
+        output = self.path("outline_solid.svg")
+        result = core.export_svg(
+            image, output, mode="outline", tolerance=0
+        )
+        self.assertEqual(result.rect_count, 1)
+        root = ET.parse(output).getroot()
+        self.assertEqual(root.get("data-pixel-mode"), "outline")
+        paths = root.findall(f".//{SVG_NS}path")
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0].get("fill-rule"), "evenodd")
+        self.assertEqual(len(root.findall(f".//{SVG_NS}rect")), 0)
+
+    def test_outline_region_with_hole_has_two_subpaths(self):
+        image_path = self.path("outline_hole.png")
+
+        def pixel(x, y):
+            if 1 <= x <= 3 and 1 <= y <= 3:
+                return (0, 0, 0, 0)
+            return (200, 50, 40, 255)
+
+        make_png(image_path, 5, 5, pixel)
+        image = core.load_bitmap(
+            image_path, backend="wic" if core.IS_WINDOWS else "auto"
+        )
+        regions = list(core.iter_outline_regions(image, 0))
+        self.assertEqual(len(regions), 1)
+        path = regions[0][0]
+        self.assertEqual(path.count("M"), 2)
+        self.assertIn("z", path)
+        output = self.path("outline_hole.svg")
+        core.export_svg(image, output, mode="outline")
+        root = ET.parse(output).getroot()
+        paths = root.findall(f".//{SVG_NS}path")
+        self.assertEqual(paths[0].get("fill-rule"), "evenodd")
+
+    def test_outline_disconnected_regions(self):
+        image_path = self.path("outline_disconnected.png")
+
+        def pixel(x, y):
+            if 0 <= x < 2 and 0 <= y < 2:
+                return (255, 0, 0, 255)
+            if 4 <= x < 6 and 2 <= y < 4:
+                return (255, 0, 0, 255)
+            return (0, 0, 0, 0)
+
+        make_png(image_path, 6, 4, pixel)
+        image = core.load_bitmap(
+            image_path, backend="wic" if core.IS_WINDOWS else "auto"
+        )
+        self.assertEqual(
+            core.measure_outline_regions(image, 0)[0], 2
+        )
+
+    def test_outline_tolerance_connects_similar_pixels(self):
+        image_path = self.path("outline_tolerance.png")
+
+        def pixel(x, _y):
+            return (100 + x * 2, 50, 60, 255)
+
+        make_png(image_path, 6, 2, pixel)
+        image = core.load_bitmap(
+            image_path, backend="wic" if core.IS_WINDOWS else "auto"
+        )
+        self.assertEqual(core.measure_outline_regions(image, 1)[0], 6)
+        self.assertEqual(core.measure_outline_regions(image, 4)[0], 1)
+
     def test_alpha_text_round_trips_to_8bit(self):
         for alpha in range(1, 255):
             text = core._opacity_text(alpha)
