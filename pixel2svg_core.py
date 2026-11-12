@@ -9,6 +9,7 @@ Pixel2SVG · 核心模块
 规则：
     * 默认 strict：一个不透明/半透明像素 -> 一个 1×1 的 <rect>
     * compact：每种 RGBA 颜色一条 <path>，每个像素仍是 1×1 子路径
+    * merged：允许把相邻、容差内的近似色合并成更大的矩形
     * 支持从整图中裁出矩形区域后再导出
     * 完全透明的像素          ->  不生成图形（画布保持透明）
     * 像素颜色按 sRGB 原样保存，透明度写入 fill-opacity
@@ -772,11 +773,15 @@ def estimate_svg_size(
     image: BitmapImage,
     mode: str = "strict",
     color_count: Optional[int] = None,
+    rect_count: Optional[int] = None,
 ) -> int:
     """估算 SVG 文件大小，用于界面提示。"""
     if mode == "compact":
         colors = max(1, color_count or 1)
         return 1200 + image.opaque_count * 12 + colors * 95
+    if mode == "merged":
+        count = image.opaque_count if rect_count is None else rect_count
+        return 1200 + count * 72
     translucent = min(image.translucent_count, image.opaque_count)
     return 900 + image.opaque_count * 57 + translucent * 26
 
@@ -872,6 +877,142 @@ def count_visible_colors(
     return len(seen)
 
 
+def _within_tolerance(
+    red: int,
+    green: int,
+    blue: int,
+    alpha: int,
+    other: tuple[int, int, int, int],
+    tolerance: int,
+) -> bool:
+    return (
+        abs(red - other[0]) <= tolerance
+        and abs(green - other[1]) <= tolerance
+        and abs(blue - other[2]) <= tolerance
+        and abs(alpha - other[3]) <= tolerance
+    )
+
+
+def iter_merged_rectangles(
+    image: BitmapImage, tolerance: int = 0
+):
+    """按行合并相邻近似色像素，生成更大的矩形。
+
+    生成 (x, y, width, height, red, green, blue, alpha, y_end)。
+    tolerance 是对 RGBA 四个通道分别允许的最大差值；0 表示完全同色。
+    y_end 等于 y+height，用于导出进度。
+
+    做法：每行先做水平游程，再与上一行 x 范围相同的矩形纵向合并。
+    透明像素不进入矩形。
+    """
+    tolerance = max(0, min(255, int(tolerance)))
+    width, height = image.width, image.height
+    rgba = image.rgba
+    active: dict[tuple[int, int], tuple[int, int, int, int, int]] = {}
+
+    for y in range(height):
+        runs: list[tuple[int, int, int, int, int, int]] = []
+        x = 0
+        row_start = y * width * 4
+        while x < width:
+            offset = row_start + x * 4
+            alpha = rgba[offset + 3]
+            if alpha == 0:
+                x += 1
+                continue
+            red, green, blue = (
+                rgba[offset],
+                rgba[offset + 1],
+                rgba[offset + 2],
+            )
+            start = x
+            x += 1
+            while x < width:
+                offset = row_start + x * 4
+                next_alpha = rgba[offset + 3]
+                if next_alpha == 0:
+                    break
+                if _within_tolerance(
+                    red,
+                    green,
+                    blue,
+                    alpha,
+                    (
+                        rgba[offset],
+                        rgba[offset + 1],
+                        rgba[offset + 2],
+                        next_alpha,
+                    ),
+                    tolerance,
+                ):
+                    x += 1
+                else:
+                    break
+            runs.append((start, x, red, green, blue, alpha))
+
+        next_active: dict[tuple[int, int], tuple[int, int, int, int, int]] = {}
+        for start, end, red, green, blue, alpha in runs:
+            key = (start, end)
+            previous = active.pop(key, None)
+            if previous is not None and _within_tolerance(
+                red,
+                green,
+                blue,
+                alpha,
+                (previous[1], previous[2], previous[3], previous[4]),
+                tolerance,
+            ):
+                next_active[key] = previous
+            else:
+                if previous is not None:
+                    y_start, pr, pg, pb, pa = previous
+                    yield (
+                        start,
+                        y_start,
+                        end - start,
+                        y - y_start,
+                        pr,
+                        pg,
+                        pb,
+                        pa,
+                        y,
+                    )
+                next_active[key] = (y, red, green, blue, alpha)
+
+        for (start, end), previous in active.items():
+            y_start, pr, pg, pb, pa = previous
+            yield (
+                start,
+                y_start,
+                end - start,
+                y - y_start,
+                pr,
+                pg,
+                pb,
+                pa,
+                y,
+            )
+        active = next_active
+
+    for (start, end), previous in active.items():
+        y_start, pr, pg, pb, pa = previous
+        yield (
+            start,
+            y_start,
+            end - start,
+            height - y_start,
+            pr,
+            pg,
+            pb,
+            pa,
+            height,
+        )
+
+
+def count_merged_rectangles(image: BitmapImage, tolerance: int = 0) -> int:
+    return sum(1 for _ in iter_merged_rectangles(image, tolerance))
+
+
 def _opacity_text(alpha: int) -> str:
     text = f"{alpha / 255:.6f}".rstrip("0").rstrip(".")
     return text or "0"
@@ -928,19 +1069,25 @@ def export_svg(
     progress: Optional[Callable[[int, int], None]] = None,
     cancel: Optional[Callable[[], bool]] = None,
     mode: str = "strict",
+    tolerance: int = 0,
 ) -> ExportResult:
     """把图片逐像素写成一个 SVG 文件。
 
     mode="strict" : 每个非全透明像素生成一个独立的 1×1 <rect>（默认）。
     mode="compact": 每种 RGBA 生成一条 <path>，路径由多个 1×1
                     正方形子路径组成；视觉结果相同，颜色少的图像更小。
+    mode="merged" : 允许把相邻且 RGBA 差在 tolerance 以内的像素
+                    合并成更大的矩形，文件通常最小。
 
     progress(done, total) 是单调递增的工作量回调；cancel() 返回 True 时取消。
     """
     import time
 
-    if mode not in ("strict", "compact"):
-        raise ValueError("mode 必须是 strict 或 compact")
+    if mode not in ("strict", "compact", "merged"):
+        raise ValueError("mode 必须是 strict、compact 或 merged")
+    if not 0 <= int(tolerance) <= 255:
+        raise ValueError("tolerance 必须在 0 到 255 之间")
+    tolerance = int(tolerance)
     destination = Path(path).expanduser()
     if destination.suffix.lower() != ".svg":
         destination = destination.with_suffix(".svg")
@@ -975,6 +1122,12 @@ def export_svg(
             "生成一条 path，路径由多个 1×1 正方形子路径组成；"
             "透明像素保持透明。"
         )
+    elif mode == "merged":
+        description = html.escape(
+            f"Pixel2SVG 合并块转换：{region_text}"
+            f"相邻像素的 RGBA 每通道差不超过 {tolerance} 时合并为矩形；"
+            "透明像素保持透明。合并会改变逐像素结构，请按需要选用。"
+        )
     else:
         description = html.escape(
             f"Pixel2SVG 严格逐像素转换：{region_text}"
@@ -990,7 +1143,12 @@ def export_svg(
                 f'width="{display_width}" height="{display_height}" '
                 f'viewBox="0 0 {width} {height}" version="1.1" '
                 f'data-pixel-mode="{mode}" '
-                f'shape-rendering="crispEdges">\n'
+                + (
+                    f'data-tolerance="{tolerance}" '
+                    if mode == "merged"
+                    else ""
+                )
+                + f'shape-rendering="crispEdges">\n'
             )
             handle.write(f"  <title>{title}</title>\n")
             handle.write(f"  <desc>{description}</desc>\n")
@@ -1029,7 +1187,7 @@ def export_svg(
                         y % 8 == 0 or y + 1 == height
                     ):
                         progress(y + 1, height)
-            else:
+            elif mode == "compact":
                 groups, total_steps = _collect_compact_positions(
                     image, progress, cancel
                 )
@@ -1071,6 +1229,45 @@ def export_svg(
                     rect_count = written
                     if progress is not None:
                         progress(height + written, total_steps)
+            else:
+                last_progress = 0
+                since_cancel_check = 0
+                for (
+                    x,
+                    y,
+                    rect_width,
+                    rect_height,
+                    red,
+                    green,
+                    blue,
+                    alpha,
+                    y_end,
+                ) in iter_merged_rectangles(image, tolerance):
+                    since_cancel_check += 1
+                    if since_cancel_check >= 256:
+                        since_cancel_check = 0
+                        if cancel is not None and cancel():
+                            raise ExportCancelled("导出已取消")
+                    color = f"#{red:02x}{green:02x}{blue:02x}"
+                    if alpha == 255:
+                        handle.write(
+                            f'    <rect x="{x}" y="{y}" '
+                            f'width="{rect_width}" height="{rect_height}" '
+                            f'fill="{color}"/>\n'
+                        )
+                    else:
+                        handle.write(
+                            f'    <rect x="{x}" y="{y}" '
+                            f'width="{rect_width}" height="{rect_height}" '
+                            f'fill="{color}" '
+                            f'fill-opacity="{_opacity_text(alpha)}"/>\n'
+                        )
+                    rect_count += 1
+                    if progress is not None and y_end > last_progress:
+                        last_progress = y_end
+                        progress(y_end, height)
+                if progress is not None and last_progress < height:
+                    progress(height, height)
 
             handle.write("  </g>\n")
             handle.write("</svg>\n")

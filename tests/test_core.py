@@ -295,6 +295,84 @@ class CoreTests(unittest.TestCase):
             core.export_svg(image, output, mode="compact")
         self.assertFalse(output.exists())
 
+    def test_merged_solid_block_is_one_rectangle(self):
+        image_path = self.path("merged_solid.png")
+        make_png(image_path, 5, 4, lambda _x, _y: (20, 80, 160, 255))
+        image = core.load_bitmap(
+            image_path, backend="wic" if core.IS_WINDOWS else "auto"
+        )
+        self.assertEqual(core.count_merged_rectangles(image, 0), 1)
+        output = self.path("merged_solid.svg")
+        result = core.export_svg(
+            image, output, mode="merged", tolerance=0
+        )
+        self.assertEqual(result.rect_count, 1)
+        root = ET.parse(output).getroot()
+        self.assertEqual(root.get("data-pixel-mode"), "merged")
+        self.assertEqual(root.get("data-tolerance"), "0")
+        rects = root.findall(f".//{SVG_NS}rect")
+        self.assertEqual(len(rects), 1)
+        self.assertEqual(rects[0].get("width"), "5")
+        self.assertEqual(rects[0].get("height"), "4")
+
+    def test_merged_tolerance_groups_similar_colors(self):
+        image_path = self.path("merged_tolerance.png")
+
+        def pixel(x, _y):
+            return (100 + x * 2, 50, 60, 255)
+
+        make_png(image_path, 6, 2, pixel)
+        image = core.load_bitmap(
+            image_path, backend="wic" if core.IS_WINDOWS else "auto"
+        )
+        self.assertEqual(core.count_merged_rectangles(image, 0), 6)
+        self.assertEqual(core.count_merged_rectangles(image, 4), 2)
+        self.assertEqual(core.count_merged_rectangles(image, 10), 1)
+        rects = list(core.iter_merged_rectangles(image, 4))
+        self.assertEqual([rect[2] for rect in rects], [3, 3])
+        self.assertEqual([rect[3] for rect in rects], [2, 2])
+
+    def test_merged_svg_reconstructs_pixels_exactly_at_zero_tolerance(self):
+        image_path = self.path("merged_reconstruct.png")
+
+        def pixel(x, y):
+            if (x + y * 3) % 7 == 0:
+                return (0, 0, 0, 0)
+            return (
+                (x * 43 + 5) % 256,
+                (y * 67 + 11) % 256,
+                (x * 19 + y * 23) % 256,
+                (x * 31 + y * 47 + 1) % 256,
+            )
+
+        make_png(image_path, 8, 5, pixel)
+        image = core.load_bitmap(
+            image_path, backend="wic" if core.IS_WINDOWS else "auto"
+        )
+        output = self.path("merged_reconstruct.svg")
+        core.export_svg(image, output, mode="merged", tolerance=0)
+        root = ET.parse(output).getroot()
+        rebuilt = bytearray(image.width * image.height * 4)
+        for rect in root.findall(f".//{SVG_NS}rect"):
+            x = int(rect.get("x"))
+            y = int(rect.get("y"))
+            width = int(rect.get("width"))
+            height = int(rect.get("height"))
+            fill = rect.get("fill").lstrip("#")
+            red, green, blue = (
+                int(fill[0:2], 16),
+                int(fill[2:4], 16),
+                int(fill[4:6], 16),
+            )
+            alpha = round(float(rect.get("fill-opacity", "1")) * 255)
+            for yy in range(y, y + height):
+                for xx in range(x, x + width):
+                    offset = (yy * image.width + xx) * 4
+                    rebuilt[offset:offset + 4] = bytes(
+                        (red, green, blue, alpha)
+                    )
+        self.assertEqual(bytes(rebuilt), image.rgba)
+
     def test_alpha_text_round_trips_to_8bit(self):
         for alpha in range(1, 255):
             text = core._opacity_text(alpha)

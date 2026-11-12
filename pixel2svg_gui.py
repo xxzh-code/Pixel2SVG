@@ -24,7 +24,7 @@ from typing import Optional
 import pixel2svg_core as core
 
 APP_TITLE = "Pixel2SVG · 像素矢量工坊"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 # 色彩系统：暖纸色 + 墨绿 + 珊瑚色
 BG = "#F3F0E8"
@@ -198,10 +198,18 @@ class ScrollFrame(tk.Frame):
 
 
 class ExportProgressDialog(tk.Toplevel):
-    def __init__(self, parent, path: Path, total_rects: int, on_cancel):
+    def __init__(
+        self,
+        parent,
+        path: Path,
+        total_rects: int,
+        on_cancel,
+        unit: str = "正方形",
+    ):
         super().__init__(parent)
         self.root = parent
         self.on_cancel = on_cancel
+        self.unit = unit
         self.cancelled = False
         self.title("正在生成 SVG")
         self.configure(bg=PANEL)
@@ -229,7 +237,7 @@ class ExportProgressDialog(tk.Toplevel):
         ).pack(side="left", padx=px(20))
         tk.Label(
             header,
-            text="STRICT PIXEL MODE",
+            text="PIXEL MODE",
             bg=INK,
             fg="#8FB7AA",
             font=(FONT_MONO, 8),
@@ -246,7 +254,7 @@ class ExportProgressDialog(tk.Toplevel):
             font=(FONT_MONO, 9),
         ).pack(fill="x")
         self.detail_var = tk.StringVar(
-            value=f"0 / {total_rects:,} 个正方形"
+            value=f"0 / {total_rects:,} 个{unit}"
         )
         tk.Label(
             body,
@@ -309,7 +317,7 @@ class ExportProgressDialog(tk.Toplevel):
         self.bar["value"] = fraction * 100.0
         self.percent_var.set(f"{fraction * 100:.0f}%")
         self.detail_var.set(
-            f"{done_rects:,} 个正方形 / 约 {fraction * 100:.0f}%"
+            f"{done_rects:,} 个{self.unit} / 约 {fraction * 100:.0f}%"
         )
 
     def set_indeterminate_note(self, text: str) -> None:
@@ -372,6 +380,13 @@ class Pixel2SVGApp:
         self._crop_dragging = False
         self._color_count_cache: Optional[int] = None
         self._color_count_ready = False
+        self._merge_count_image: Optional[core.BitmapImage] = None
+        self._merge_count_tolerance: Optional[int] = None
+        self._merge_count_value: Optional[int] = None
+        self._merge_count_ready = False
+        self._tolerance_job: Optional[str] = None
+        self._active_export_mode = "strict"
+        self._active_export_tolerance = 0
         self.loading = False
         self.exporting = False
         self._pending_close = False
@@ -395,6 +410,11 @@ class Pixel2SVGApp:
         self.grid_var = tk.BooleanVar(value=True)
         self.crop_mode_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value="strict")
+        self.tolerance_var = tk.IntVar(value=0)
+        self.tolerance_value_var = tk.StringVar(value="0")
+        self.rule_var = tk.StringVar(
+            value="1 像素   →   1 个 1×1 矢量正方形"
+        )
         self.mode_note_var = tk.StringVar(
             value="不合并同色像素 · 不做轮廓拟合 · 不使用抗锯齿"
         )
@@ -457,7 +477,7 @@ class Pixel2SVGApp:
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         width = min(px(1280), max(px(960), screen_w - px(48)))
-        height = min(px(900), max(px(700), screen_h - px(90)))
+        height = min(px(930), max(px(700), screen_h - px(90)))
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 2 - px(12))
         self.root.geometry(f"{width}x{height}+{x}+{y}")
@@ -740,7 +760,7 @@ class Pixel2SVGApp:
         )
         tk.Label(
             rule_inner,
-            text="1 像素   →   1 个 1×1 矢量正方形",
+            textvariable=self.rule_var,
             bg=PANEL_SOFT,
             fg=INK,
             font=(FONT_UI, 9, "bold"),
@@ -809,6 +829,7 @@ class Pixel2SVGApp:
         for value, text in (
             ("strict", "严格 rect"),
             ("compact", "紧凑 path"),
+            ("merged", "合并块"),
         ):
             button = tk.Radiobutton(
                 mode_box,
@@ -830,14 +851,56 @@ class Pixel2SVGApp:
                 cursor="hand2",
             )
             button.pack(side="left", padx=(px(3), 0))
+
+        self.tolerance_row = tk.Frame(box, bg=PANEL)
         tk.Label(
+            self.tolerance_row,
+            text="颜色容差",
+            bg=PANEL,
+            fg=INK,
+            font=(FONT_UI, 9),
+        ).pack(side="left")
+        self.tolerance_scale = tk.Scale(
+            self.tolerance_row,
+            from_=0,
+            to=100,
+            resolution=1,
+            orient="horizontal",
+            variable=self.tolerance_var,
+            command=self._on_tolerance_changed,
+            showvalue=False,
+            bg=PANEL,
+            fg=INK,
+            activebackground=ACCENT,
+            troughcolor="#E4DFD3",
+            highlightthickness=0,
+            bd=0,
+            sliderlength=px(11),
+            width=px(7),
+            length=px(165),
+        )
+        self.tolerance_scale.pack(
+            side="left", fill="x", expand=True, padx=(px(8), px(6))
+        )
+        tk.Label(
+            self.tolerance_row,
+            textvariable=self.tolerance_value_var,
+            bg=PANEL,
+            fg=MUTED,
+            width=3,
+            anchor="e",
+            font=(FONT_MONO, 8),
+        ).pack(side="right")
+
+        self.display_size_label = tk.Label(
             box,
             textvariable=self.display_size_var,
             bg=PANEL,
             fg=MUTED_LIGHT,
             anchor="w",
             font=(FONT_MONO, 8),
-        ).pack(fill="x", pady=(px(5), px(9)))
+        )
+        self.display_size_label.pack(fill="x", pady=(px(5), px(9)))
 
         stats = tk.Frame(
             box,
@@ -861,13 +924,16 @@ class Pixel2SVGApp:
                 fg=INK,
                 font=(FONT_MONO, 11, "bold"),
             ).pack()
-            tk.Label(
+            caption = tk.Label(
                 cell,
                 text=captions[index],
                 bg=PANEL_SOFT,
                 fg=MUTED,
                 font=(FONT_UI, 8),
-            ).pack(pady=(px(1), 0))
+            )
+            caption.pack(pady=(px(1), 0))
+            if index == 0:
+                self.rect_caption_label = caption
             if index < 2:
                 tk.Frame(
                     stats, bg="#E4DED1", width=1, height=px(28)
@@ -1283,6 +1349,7 @@ class Pixel2SVGApp:
         self._crop_dragging = False
         self._color_count_cache = None
         self._color_count_ready = False
+        self._invalidate_merge_count()
         self.canvas.configure(cursor="")
         self._refresh_action_states()
         try:
@@ -1371,6 +1438,13 @@ class Pixel2SVGApp:
             f"{image.height * value}"
         )
 
+    def _get_tolerance(self) -> int:
+        try:
+            value = int(self.tolerance_var.get())
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(100, value))
+
     def _get_color_count(self) -> Optional[int]:
         if self._color_count_ready:
             return self._color_count_cache
@@ -1386,30 +1460,100 @@ class Pixel2SVGApp:
         self._color_count_ready = True
         return self._color_count_cache
 
-    def _on_mode_changed(self) -> None:
-        if self.image is None:
-            self.mode_note_var.set(
-                "不合并同色像素 · 不做轮廓拟合 · 不使用抗锯齿"
-                if self.mode_var.get() == "strict"
-                else "每色一条 path · 像素仍为 1×1 方格 · 文件更小"
+    def _invalidate_merge_count(self) -> None:
+        self._merge_count_image = None
+        self._merge_count_tolerance = None
+        self._merge_count_value = None
+        self._merge_count_ready = False
+
+    def _get_merged_count(self, image: core.BitmapImage) -> Optional[int]:
+        tolerance = self._get_tolerance()
+        if (
+            self._merge_count_ready
+            and self._merge_count_image is image
+            and self._merge_count_tolerance == tolerance
+        ):
+            return self._merge_count_value
+        self._merge_count_image = image
+        self._merge_count_tolerance = tolerance
+        self._merge_count_ready = True
+        if image.total_pixels > 2_500_000:
+            self._merge_count_value = None
+        else:
+            self._merge_count_value = core.count_merged_rectangles(
+                image, tolerance
             )
+        return self._merge_count_value
+
+    def _on_tolerance_changed(self, value=None) -> None:
+        try:
+            tolerance = int(float(value if value is not None else self.tolerance_var.get()))
+        except (TypeError, ValueError):
+            tolerance = 0
+        tolerance = max(0, min(100, tolerance))
+        self.tolerance_var.set(tolerance)
+        self.tolerance_value_var.set(str(tolerance))
+        self._invalidate_merge_count()
+        if self.mode_var.get() != "merged":
             return
+        if self._tolerance_job is not None:
+            try:
+                self.root.after_cancel(self._tolerance_job)
+            except tk.TclError:
+                pass
+        self._tolerance_job = self.root.after(180, self._refresh_tolerance_stats)
+
+    def _refresh_tolerance_stats(self) -> None:
+        self._tolerance_job = None
+        if self.mode_var.get() == "merged":
+            self._update_stats()
+            self._on_scale_changed()
+
+    def _on_mode_changed(self) -> None:
+        mode = self.mode_var.get()
+        if mode == "merged":
+            if not self.tolerance_row.winfo_manager():
+                self.tolerance_row.pack(
+                    fill="x",
+                    pady=(px(5), 0),
+                    before=self.display_size_label,
+                )
+        else:
+            self.tolerance_row.pack_forget()
         self._update_stats()
         self._on_scale_changed()
 
     def _update_stats(self) -> None:
         image = self._effective_image()
+        mode = self.mode_var.get()
+        if hasattr(self, "rect_caption_label"):
+            self.rect_caption_label.configure(
+                text="矩形" if mode == "merged" else "正方形"
+            )
+        if mode == "merged":
+            self.rule_var.set("相邻近似色   →   合并为矩形")
+        elif mode == "compact":
+            self.rule_var.set("1 像素   →   1 个 path 子方格")
+        else:
+            self.rule_var.set("1 像素   →   1 个 1×1 矢量正方形")
         if image is None:
             self.rect_var.set("—")
             self.alpha_var.set("—")
             self.size_var.set("—")
-            self.mode_note_var.set(
-                "不合并同色像素 · 不做轮廓拟合 · 不使用抗锯齿"
-                if self.mode_var.get() == "strict"
-                else "每色一条 path · 像素仍为 1×1 方格 · 文件更小"
-            )
+            if mode == "merged":
+                self.mode_note_var.set(
+                    f"合并块 · 容差 {self._get_tolerance()} · "
+                    "相邻近似色合并为矩形"
+                )
+            elif mode == "compact":
+                self.mode_note_var.set(
+                    "每色一条 path · 像素仍为 1×1 方格 · 文件更小"
+                )
+            else:
+                self.mode_note_var.set(
+                    "不合并同色像素 · 不做轮廓拟合 · 不使用抗锯齿"
+                )
             return
-        self.rect_var.set(f"{image.opaque_count:,}")
         transparent_ratio = (
             image.non_opaque_count / image.total_pixels * 100.0
             if image.total_pixels
@@ -1421,7 +1565,8 @@ class Pixel2SVGApp:
             self.alpha_var.set(f"{transparent_ratio:.0f}%")
         else:
             self.alpha_var.set(f"{transparent_ratio:.1f}%")
-        if self.mode_var.get() == "compact":
+        if mode == "compact":
+            self.rect_var.set(f"{image.opaque_count:,}")
             colors = self._get_color_count()
             if colors is None:
                 self.size_var.set("颜色过多")
@@ -1441,7 +1586,35 @@ class Pixel2SVGApp:
                     f"每色一条 path · 共 {colors:,} 种颜色 · "
                     "像素仍为 1×1 方格"
                 )
+        elif mode == "merged":
+            tolerance = self._get_tolerance()
+            count = self._get_merged_count(image)
+            if count is None:
+                self.rect_var.set("—")
+                self.size_var.set("导出时算")
+                self.mode_note_var.set(
+                    f"合并块 · 容差 {tolerance} · 大图在导出时统计矩形"
+                )
+            else:
+                self.rect_var.set(f"{count:,}")
+                self.size_var.set(
+                    core.human_size(
+                        core.estimate_svg_size(
+                            image, mode="merged", rect_count=count
+                        )
+                    )
+                )
+                if tolerance == 0:
+                    self.mode_note_var.set(
+                        f"仅合并完全相同的颜色 · 共 {count:,} 个矩形"
+                    )
+                else:
+                    self.mode_note_var.set(
+                        f"相邻色差 ≤ {tolerance} 合并为矩形 · "
+                        f"共 {count:,} 个"
+                    )
         else:
+            self.rect_var.set(f"{image.opaque_count:,}")
             self.size_var.set(core.human_size(core.estimate_svg_size(image)))
             self.mode_note_var.set(
                 "不合并同色像素 · 不做轮廓拟合 · 不使用抗锯齿"
@@ -1992,6 +2165,7 @@ class Pixel2SVGApp:
                 self.cropped_image = None
                 self._color_count_cache = None
                 self._color_count_ready = False
+                self._invalidate_merge_count()
                 self._update_stats()
                 self._on_scale_changed()
                 self._refresh_crop_controls()
@@ -2012,6 +2186,7 @@ class Pixel2SVGApp:
         self._crop_dragging = False
         self._color_count_cache = None
         self._color_count_ready = False
+        self._invalidate_merge_count()
         self._refresh_crop_controls()
         self._update_stats()
         self._on_scale_changed()
@@ -2108,6 +2283,7 @@ class Pixel2SVGApp:
         self.cropped_image = cropped
         self._color_count_cache = None
         self._color_count_ready = False
+        self._invalidate_merge_count()
         self._refresh_crop_controls()
         self._update_stats()
         self._on_scale_changed()
@@ -2287,6 +2463,9 @@ class Pixel2SVGApp:
             return
         scale = self._get_scale()
         mode = self.mode_var.get()
+        tolerance = self._get_tolerance() if mode == "merged" else 0
+        colors = None
+        merged_count = None
         if mode == "compact":
             colors = self._get_color_count()
             if colors is None:
@@ -2304,8 +2483,8 @@ class Pixel2SVGApp:
                 self._on_mode_changed()
                 mode = "strict"
                 colors = None
-        else:
-            colors = None
+        elif mode == "merged":
+            merged_count = self._get_merged_count(image)
 
         source = self.source_path or Path("pixel2svg")
         initial = self.output_path or source.with_suffix(".svg")
@@ -2322,25 +2501,62 @@ class Pixel2SVGApp:
         destination = Path(path)
         if destination.suffix.lower() != ".svg":
             destination = destination.with_suffix(".svg")
-        if image.opaque_count > 250_000:
-            estimated = core.human_size(
-                core.estimate_svg_size(
-                    image, mode=mode, color_count=colors
+        item_count = (
+            merged_count
+            if mode == "merged" and merged_count is not None
+            else image.opaque_count
+        )
+        if item_count > 250_000:
+            if mode == "merged":
+                estimated = core.human_size(
+                    core.estimate_svg_size(
+                        image,
+                        mode="merged",
+                        rect_count=merged_count
+                        if merged_count is not None
+                        else image.opaque_count,
+                    )
                 )
-            )
-            shape_word = "矩形" if mode == "strict" else "正方形子路径"
-            mode_word = "严格逐像素" if mode == "strict" else "紧凑路径"
+                shape_word = "矩形"
+                mode_word = f"合并块（容差 {tolerance}）"
+                detail = (
+                    f"最多会生成 {item_count:,} 个矩形，预计约 {estimated}。"
+                )
+                action = "会按容差把相邻近似色合并为大矩形"
+            elif mode == "compact":
+                estimated = core.human_size(
+                    core.estimate_svg_size(
+                        image, mode="compact", color_count=colors
+                    )
+                )
+                shape_word = "正方形子路径"
+                mode_word = "紧凑路径"
+                detail = (
+                    f"将生成 {item_count:,} 个{shape_word}，"
+                    f"预计约 {estimated}。"
+                )
+                action = "不会合并像素"
+            else:
+                estimated = core.human_size(core.estimate_svg_size(image))
+                shape_word = "矩形"
+                mode_word = "严格逐像素"
+                detail = (
+                    f"将生成 {item_count:,} 个{shape_word}，"
+                    f"预计约 {estimated}。"
+                )
+                action = "不会合并像素"
             area_word = "当前选区" if self.cropped_image else "这张图"
             confirmed = messagebox.askyesno(
                 "SVG 会比较大",
-                f"{area_word}有 {image.opaque_count:,} 个待翻译像素，"
-                f"将生成同样数量的{shape_word}，预计约 {estimated}。\n\n"
-                f"{mode_word}模式不会合并像素。仍然继续吗？",
+                f"{area_word}{detail}\n\n"
+                f"{mode_word}模式{action}。仍然继续吗？",
                 parent=self.root,
             )
             if not confirmed:
                 return
-        self._start_export(destination, scale, image, mode)
+        self._start_export(
+            destination, scale, image, mode, tolerance
+        )
 
     def _start_export(
         self,
@@ -2348,24 +2564,37 @@ class Pixel2SVGApp:
         scale: int,
         image: Optional[core.BitmapImage] = None,
         mode: str = "strict",
+        tolerance: int = 0,
     ) -> None:
         if image is None:
             image = self._effective_image()
         if image is None:
             return
+        expected_rects = image.opaque_count
+        if mode == "merged":
+            merged_count = self._get_merged_count(image)
+            if merged_count is not None:
+                expected_rects = merged_count
+        unit = "矩形" if mode == "merged" else "正方形"
+        self._active_export_mode = mode
+        self._active_export_tolerance = tolerance
         self.exporting = True
         self._export_cancel = threading.Event()
         self._export_queue = queue.Queue()
         self._refresh_action_states()
-        self._set_status(
-            f"正在逐像素生成 {image.opaque_count:,} 个正方形…",
-            "busy",
-        )
+        if mode == "merged":
+            self._set_status("正在按容差合并相邻色块…", "busy")
+        else:
+            self._set_status(
+                f"正在逐像素生成 {image.opaque_count:,} 个正方形…",
+                "busy",
+            )
         self._progress_dialog = ExportProgressDialog(
             self.root,
             destination,
-            image.opaque_count,
+            expected_rects,
             self._cancel_export,
+            unit=unit,
         )
         cancel_event = self._export_cancel
         output_queue = self._export_queue
@@ -2376,7 +2605,7 @@ class Pixel2SVGApp:
                 (
                     "progress",
                     fraction,
-                    int(image.opaque_count * fraction),
+                    int(expected_rects * fraction),
                 )
             )
 
@@ -2389,6 +2618,7 @@ class Pixel2SVGApp:
                     progress=progress,
                     cancel=cancel_event.is_set,
                     mode=mode,
+                    tolerance=tolerance,
                 )
             except core.ExportCancelled:
                 output_queue.put(("cancelled", None))
@@ -2441,18 +2671,22 @@ class Pixel2SVGApp:
         self.output_path = result.path
         self._update_output_path_label()
         self._refresh_action_states()
-        mode_text = (
-            f"紧凑 path · {result.color_paths:,} 条"
-            if result.mode == "compact"
-            else "严格 rect"
-        )
+        if result.mode == "compact":
+            mode_text = f"紧凑 path · {result.color_paths:,} 条"
+        elif result.mode == "merged":
+            mode_text = (
+                f"合并块 · 容差 {self._active_export_tolerance}"
+            )
+        else:
+            mode_text = "严格 rect"
+        count_word = "矩形" if result.mode == "merged" else "正方形"
         self._set_status(
-            f"已导出 {result.rect_count:,} 个正方形 · {mode_text} · "
+            f"已导出 {result.rect_count:,} 个{count_word} · {mode_text} · "
             f"{core.human_size(result.file_size)} · {result.elapsed:.1f}s",
             "done",
         )
         self._toast(
-            f"SVG 已保存 · {result.rect_count:,} 个正方形 · "
+            f"SVG 已保存 · {result.rect_count:,} 个{count_word} · "
             f"{core.human_size(result.file_size)}"
         )
         self._schedule_thumb()
